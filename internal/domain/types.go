@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"fmt"
 )
@@ -80,9 +81,22 @@ const (
 	ReasonDoubleVote         = "DOUBLE_VOTE"          // 同 target epoch 内容不同的证明
 	ReasonSurroundVote       = "SURROUND_VOTE"        // 新区间被既有记录完全包含
 	ReasonDuplicateBlockSlot = "DUPLICATE_BLOCK_SLOT" // 同一 slot 的区块重复签署
+	ReasonHistoryWatermark   = "HISTORY_WATERMARK"    // slot/epoch 已进入历史低水位区（EIP-3076 条件 2/4/5）
+	ReasonValidatorMismatch  = "VALIDATOR_MISMATCH"   // 请求声明的身份与本次签署使用的身份不一致
+	ReasonUnknownValidator   = "UNKNOWN_VALIDATOR"    // 身份在本进程托管集合中不存在
 	ReasonImportConflict     = "IMPORT_CONFLICT"      // 导入数据与既有记录构成罚没冲突
 	ReasonImportInvalid      = "IMPORT_INVALID"       // 导入文件格式 / 内容不合法
 )
+
+// DummySigningRoot 是 EIP-3076 建议的缺失 signing_root 占位值（0x0）。
+// 导入的无 signing_root 条目内部统一记为该占位根，保守地参与冲突判定：
+// 任何真实签名根都不会与它相等，因此同 slot/target 的新内容一律视为冲突。
+var DummySigningRoot = append([]byte(nil), bytes.Repeat([]byte{0x00}, 32)...)
+
+// HasSigningRoot 报告记录是否携带真实（可用于判断“同一次签署内容”的）签名根。
+func HasSigningRoot(root []byte) bool {
+	return len(root) != 0 && !bytes.Equal(root, DummySigningRoot)
+}
 
 // GuardError 携带可区分原因码与说明，绝不代表“已签署”。
 type GuardError struct {
