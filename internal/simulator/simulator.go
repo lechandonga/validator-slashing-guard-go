@@ -14,6 +14,7 @@ type Simulator struct {
 	state      *domain.ChainState
 	proposerAt map[uint64]uint64 // slot -> 被选中的验证者索引
 	headAtSlot map[uint64][]byte
+	pubkeys    map[uint64][]byte // validator index -> BLS 公钥
 }
 
 func New(state *domain.ChainState) *Simulator {
@@ -21,7 +22,13 @@ func New(state *domain.ChainState) *Simulator {
 		state:      state,
 		proposerAt: map[uint64]uint64{},
 		headAtSlot: map[uint64][]byte{},
+		pubkeys:    map[uint64][]byte{},
 	}
+}
+
+// RegisterPubkey 登记验证者的链上公钥，使生成的职责自动携带正确身份。
+func (s *Simulator) RegisterPubkey(validatorIndex uint64, pubkey []byte) {
+	s.pubkeys[validatorIndex] = append([]byte(nil), pubkey...)
 }
 
 // SetProposer 指定某 slot 的出块验证者（本地职责分配）。
@@ -57,6 +64,7 @@ func (s *Simulator) Advance(validatorIndex uint64, inCommittee bool) (domain.Att
 	}
 	return domain.AttestationRequest{
 		Duty:            domain.Duty{ValidatorIndex: validatorIndex, Slot: slot},
+		BeaconPublicKey: append([]byte(nil), s.pubkeys[validatorIndex]...),
 		SourceEpoch:     justified,
 		TargetEpoch:     domain.EpochOf(slot),
 		BeaconBlockRoot: root,
@@ -79,12 +87,14 @@ func (s *Simulator) BlockDuty(validatorIndex uint64) (domain.BlockProposalReques
 	bw := sha256.New()
 	bw.Write([]byte("local/body"))
 	bw.Write(u64b(h.CurrentSlot))
-	return domain.BlockProposalRequest{
-		Duty:       domain.Duty{ValidatorIndex: validatorIndex, Slot: h.CurrentSlot},
-		ParentRoot: append([]byte(nil), parentRoot...),
-		StateRoot:  stateRoot,
-		BodyRoot:   bw.Sum(nil),
-	}, true
+	req := domain.BlockProposalRequest{
+		Duty:            domain.Duty{ValidatorIndex: validatorIndex, Slot: h.CurrentSlot},
+		BeaconPublicKey: append([]byte(nil), s.pubkeys[validatorIndex]...),
+		ParentRoot:      append([]byte(nil), parentRoot...),
+		StateRoot:       stateRoot,
+		BodyRoot:        bw.Sum(nil),
+	}
+	return req, true
 }
 
 // Rollback 把链回退到历史 slot（使用当时生成的头根），用于交织测试。
@@ -102,6 +112,7 @@ func (s *Simulator) AttestationFor(validatorIndex uint64) domain.AttestationRequ
 	h := s.state.Snapshot()
 	return domain.AttestationRequest{
 		Duty:            domain.Duty{ValidatorIndex: validatorIndex, Slot: h.CurrentSlot},
+		BeaconPublicKey: append([]byte(nil), s.pubkeys[validatorIndex]...),
 		SourceEpoch:     h.JustifiedEpoch,
 		TargetEpoch:     domain.EpochOf(h.CurrentSlot),
 		BeaconBlockRoot: append([]byte(nil), h.HeadRoot...),

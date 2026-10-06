@@ -17,16 +17,32 @@ import (
 
 var gvr = []byte("local-genesis-validators-root-0001")
 
+func beaconPubkey(b byte) []byte {
+	k := make([]byte, 48)
+	for i := range k {
+		k[i] = b
+	}
+	return k
+}
+
+func newValidator(index uint64, id byte) *guard.Validator {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return guard.NewValidator(index, beaconPubkey(id), priv)
+}
+
 type env struct {
 	t      *testing.T
 	state  *domain.ChainState
 	store  *store.Store
 	client *guard.Client
-	val    *guard.Validator
+	vals   map[uint64]*guard.Validator
 	dir    string
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, indices ...uint64) *env {
 	t.Helper()
 	dir := t.TempDir()
 	state := domain.NewChainState(gvr, []byte{1, 0, 0, 0}, []byte("genesis-head"))
@@ -34,17 +50,22 @@ func setup(t *testing.T) *env {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	if len(indices) == 0 {
+		indices = []uint64{1}
 	}
-	_ = pub
-	val := guard.NewValidator(1, priv)
-	return &env{t: t, state: state, store: st, client: guard.NewClient(state, st, val), val: val, dir: dir}
+	vals := map[uint64]*guard.Validator{}
+	var list []*guard.Validator
+	for i, index := range indices {
+		v := newValidator(index, byte(0xA0+i))
+		vals[index] = v
+		list = append(list, v)
+	}
+	return &env{t: t, state: state, store: st,
+		client: guard.NewClient(state, st, list...), vals: vals, dir: dir}
 }
 
-// advanceTo 推进到指定 slot，返回与链头一致的证明职责。
-func (e *env) advanceTo(slot, justified uint64) domain.AttestationRequest {
+// advanceTo 推进到指定 slot，返回与链头一致、归属 validator 的证明职责。
+func (e *env) advanceTo(validator, slot, justified uint64) domain.AttestationRequest {
 	h := e.state.Snapshot()
 	for h.CurrentSlot < slot {
 		next := h.CurrentSlot + 1
@@ -53,7 +74,8 @@ func (e *env) advanceTo(slot, justified uint64) domain.AttestationRequest {
 		h = e.state.Snapshot()
 	}
 	return domain.AttestationRequest{
-		Duty:            domain.Duty{ValidatorIndex: 1, Slot: slot},
+		Duty:            domain.Duty{ValidatorIndex: validator, Slot: slot},
+		BeaconPublicKey: append([]byte(nil), e.vals[validator].BeaconPubKey...),
 		SourceEpoch:     justified,
 		TargetEpoch:     domain.EpochOf(slot),
 		BeaconBlockRoot: append([]byte(nil), h.HeadRoot...),
@@ -68,17 +90,24 @@ func reason(err error) string {
 	return ""
 }
 
+func bytes32(s string) []byte {
+	b := []byte(s)
+	if len(b) >= 32 {
+		return b[:32]
+	}
+	return append(b, make([]byte, 32-len(b))...)
+}
+
 func TestAttestationAdmissionReasons(t *testing.T) {
 	t.Log("业务: 证明签名准入 —— 正常通过及各可区分拒绝原因")
 	e := setup(t)
-	duty := e.advanceTo(8, 1)
+	duty := e.advanceTo(1, 8, 1)
 
 	cases := []struct {
 		name   string
 		mutate func(*domain.AttestationRequest)
 		want   string
 	}{
-		{"合法证明可签署", nil, ""},
 		{"链头不一致被拒", func(a *domain.AttestationRequest) { a.BeaconBlockRoot = []byte("other-head-32-bytes-0000000000000") }, domain.ReasonStateMismatch},
 		{"justified epoch 不一致被拒", func(a *domain.AttestationRequest) { a.SourceEpoch = 0 }, domain.ReasonStateMismatch},
 		{"未来职责被拒", func(a *domain.AttestationRequest) {
@@ -88,21 +117,23 @@ func TestAttestationAdmissionReasons(t *testing.T) {
 		{"空区块根非法", func(a *domain.AttestationRequest) { a.BeaconBlockRoot = nil }, domain.ReasonInvalidRequest},
 		{"source>target 非法", func(a *domain.AttestationRequest) { a.SourceEpoch = 5 }, domain.ReasonInvalidRequest},
 	}
-	for i, tc := range cases {
+
+	if _, err := e.client.SignAttestation(duty); err != nil {
+		t.Fatalf("合法证明必须可签署: %v", err)
+	}
+	t.Log("用例[合法证明可签署] 通过，记录 1 条")
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := duty
-			if tc.mutate != nil {
-				tc.mutate(&req)
-			}
+			tc.mutate(&req)
 			_, err := e.client.SignAttestation(req)
-			if i == 0 {
-				if err != nil {
-					t.Fatalf("expected success, got %v", err)
-				}
-				return
-			}
 			if got := reason(err); got != tc.want {
 				t.Fatalf("want %s, got %v", tc.want, err)
+			}
+			atts, _ := e.store.Snapshot()
+			if len(atts) != 1 {
+				t.Fatalf("拒绝不得污染记录，atts=%d", len(atts))
 			}
 			t.Logf("用例[%s] 拒绝原因=%s，记录数不变", tc.name, reason(err))
 		})
@@ -110,7 +141,7 @@ func TestAttestationAdmissionReasons(t *testing.T) {
 
 	t.Run("过期职责被拒", func(t *testing.T) {
 		e2 := setup(t)
-		req := e2.advanceTo(7, 0)
+		req := e2.advanceTo(1, 7, 0)
 		if _, err := e2.client.SignAttestation(req); err != nil {
 			t.Fatalf("sign at slot 7: %v", err)
 		}
@@ -122,10 +153,109 @@ func TestAttestationAdmissionReasons(t *testing.T) {
 	})
 }
 
+func TestIdentityMismatchAndUnknownValidator(t *testing.T) {
+	t.Log("业务: 多身份归属 —— 身份不匹配/未知身份明确拒绝且不留任何记录")
+	e := setup(t, 1, 2)
+	duty := e.advanceTo(1, 8, 1)
+
+	imposter := duty
+	imposter.BeaconPublicKey = append([]byte(nil), e.vals[2].BeaconPubKey...)
+	if _, err := e.client.SignAttestation(imposter); reason(err) != domain.ReasonIdentityMismatch {
+		t.Fatalf("want IDENTITY_MISMATCH, got %v", err)
+	}
+
+	noKey := duty
+	noKey.BeaconPublicKey = nil
+	if _, err := e.client.SignAttestation(noKey); reason(err) != domain.ReasonIdentityMismatch {
+		t.Fatalf("missing pubkey want IDENTITY_MISMATCH, got %v", err)
+	}
+
+	unknown := duty
+	unknown.ValidatorIndex = 99
+	unknown.BeaconPublicKey = beaconPubkey(0x99)
+	if _, err := e.client.SignAttestation(unknown); reason(err) != domain.ReasonUnknownValidator {
+		t.Fatalf("want UNKNOWN_VALIDATOR, got %v", err)
+	}
+
+	block := domain.BlockProposalRequest{
+		Duty:            domain.Duty{ValidatorIndex: 1, Slot: 8},
+		BeaconPublicKey: append([]byte(nil), e.vals[2].BeaconPubKey...),
+		ParentRoot:      []byte("parent-root-32-bytes-0000000000000000000"),
+		StateRoot:       []byte("state-root-32-bytes-000000000000000000000"),
+		BodyRoot:        []byte("body-root-32-bytes-0000000000000000000000"),
+	}
+	if _, err := e.client.SignBlock(block); reason(err) != domain.ReasonIdentityMismatch {
+		t.Fatalf("block want IDENTITY_MISMATCH, got %v", err)
+	}
+
+	atts, blocks := e.store.Snapshot()
+	if len(atts) != 0 || len(blocks) != 0 {
+		t.Fatalf("任何身份下都不得留下记录: atts=%d blocks=%d", len(atts), len(blocks))
+	}
+	t.Log("用例: 公钥错配/缺公钥 -> IDENTITY_MISMATCH；未托管索引 -> UNKNOWN_VALIDATOR；记录零污染")
+}
+
+func TestMultiValidatorRecordIsolation(t *testing.T) {
+	t.Log("业务: 多身份记录隔离 —— 同 slot/同 target 不同身份各自判定，不串用")
+	e := setup(t, 1, 2)
+	d1 := e.advanceTo(1, 8, 1)
+	if _, err := e.client.SignAttestation(d1); err != nil {
+		t.Fatalf("v1 sign: %v", err)
+	}
+
+	// 身份 2 在完全相同的 target epoch 签不同内容：不得被身份 1 的记录判为 double vote。
+	d2 := e.advanceTo(2, 8, 1)
+	if _, err := e.client.SignAttestation(d2); err != nil {
+		t.Fatalf("v2 sign at same target must be allowed: %v", err)
+	}
+
+	// 身份 2 自己再签同 target 的另一内容 -> DOUBLE_VOTE（用纯判定函数绕开链头准入）。
+	d2Double := d2
+	d2Double.BeaconBlockRoot = bytes32("other-chain-head-root-32-bytes!xy")
+	diffHead := e.state.Snapshot()
+	diffHead.HeadRoot = d2Double.BeaconBlockRoot
+	attsNow, _ := e.store.Snapshot()
+	if _, r := guard.FindAttestationConflict(2, d2Double.SourceEpoch, d2Double.TargetEpoch,
+		d2Double.BeaconBlockRoot, d2Double.SigningRoot(diffHead), attsNow); r != domain.ReasonDoubleVote {
+		t.Fatalf("v2 same target diff root want DOUBLE_VOTE, got %q", r)
+	}
+
+	// 区块：身份 1 与身份 2 可以在同一 slot 各签各的；身份 1 自己不能签第二个。
+	mkBlock := func(val uint64, tag byte) domain.BlockProposalRequest {
+		stateRoot := make([]byte, 32)
+		stateRoot[0] = tag
+		return domain.BlockProposalRequest{
+			Duty:            domain.Duty{ValidatorIndex: val, Slot: 8},
+			BeaconPublicKey: append([]byte(nil), e.vals[val].BeaconPubKey...),
+			ParentRoot:      bytes32("parent-root-32-bytes-000000000"),
+			StateRoot:       stateRoot,
+			BodyRoot:        bytes32("body-root-32-bytes-0000000000000"),
+		}
+	}
+	if _, err := e.client.SignBlock(mkBlock(1, 1)); err != nil {
+		t.Fatalf("v1 block: %v", err)
+	}
+	if _, err := e.client.SignBlock(mkBlock(2, 2)); err != nil {
+		t.Fatalf("v2 block at same slot must be allowed: %v", err)
+	}
+	if _, err := e.client.SignBlock(mkBlock(1, 9)); reason(err) != domain.ReasonDuplicateBlockSlot {
+		t.Fatalf("v1 second block want DUPLICATE_BLOCK_SLOT, got %v", err)
+	}
+
+	atts, blocks := e.store.Snapshot()
+	if len(atts) != 2 {
+		t.Fatalf("atts=%d want 2 (one per validator)", len(atts))
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%d want 2 (one per validator)", len(blocks))
+	}
+	t.Log("用例: 证明/区块判定按身份隔离；同 target 跨身份允许、同身份冲突拒绝")
+}
+
 func TestDuplicateDutyConcurrentSingleSuccess(t *testing.T) {
 	t.Log("业务: 同一证明职责并发触发 —— 恰好一次有效签名，其余 DUPLICATE_DUTY")
 	e := setup(t)
-	duty := e.advanceTo(8, 1)
+	duty := e.advanceTo(1, 8, 1)
 
 	const n = 64
 	var wg sync.WaitGroup
@@ -164,8 +294,7 @@ func TestDoubleVoteAndSurround(t *testing.T) {
 	t.Log("业务: 防罚没判定 —— double vote 与 surround vote 均拒绝且不污染记录")
 	e := setup(t)
 
-	// 第一条：source=0,target=2（用直接通过准入的方式签）
-	first := e.advanceTo(16, 0) // slot 16 => epoch 2
+	first := e.advanceTo(1, 16, 0) // slot 16 => epoch 2
 	first.SourceEpoch = 0
 	h := e.state.Snapshot()
 	first.BeaconBlockRoot = h.HeadRoot
@@ -173,47 +302,63 @@ func TestDoubleVoteAndSurround(t *testing.T) {
 		t.Fatalf("first sign: %v", err)
 	}
 
-	// double vote：同 target=2，不同区块根。准入要求与头一致，这里直接替换头根后
-	// 通过 store.Update 已不易模拟，因此改用纯函数 FindAttestationConflict 校验规则。
 	atts, _ := e.store.Snapshot()
-	diffRoot := []byte("different-block-root-32-bytes!!!")
+	diffRoot := bytes32("different-block-root-32-bytes!!!")
 	if _, r := guard.FindAttestationConflict(1, 0, 2, diffRoot,
 		domain.AttestationRequest{
-			Duty: domain.Duty{Slot: 16}, SourceEpoch: 0, TargetEpoch: 2,
-			BeaconBlockRoot: diffRoot,
+			Duty:        domain.Duty{Slot: 16, ValidatorIndex: 1},
+			SourceEpoch: 0, TargetEpoch: 2, BeaconBlockRoot: diffRoot,
 		}.SigningRoot(h), atts); r != domain.ReasonDoubleVote {
 		t.Fatalf("want DOUBLE_VOTE, got %q", r)
 	}
 	t.Log("用例: 同 target epoch 不同内容 -> DOUBLE_VOTE")
 
-	// surround：已有 (0,2)，新 (1,?) 不可能被包含；构造已有大区间 (0,4) 再签 (1,3)
 	e2 := setup(t)
-	big := e2.advanceTo(32, 0) // epoch 4
+	big := e2.advanceTo(1, 32, 0) // epoch 4
 	big.SourceEpoch = 0
 	if _, err := e2.client.SignAttestation(big); err != nil {
 		t.Fatalf("big sign: %v", err)
 	}
 	atts2, _ := e2.store.Snapshot()
-	innerRoot := []byte("inner-head-32-bytes-000000000000000000000000")
+	innerRoot := bytes32("inner-head-32-bytes-000000000000")
 	if _, r := guard.FindAttestationConflict(1, 1, 3, innerRoot,
 		domain.AttestationRequest{
-			Duty: domain.Duty{Slot: 30}, SourceEpoch: 1, TargetEpoch: 3,
-			BeaconBlockRoot: innerRoot,
+			Duty:        domain.Duty{Slot: 30, ValidatorIndex: 1},
+			SourceEpoch: 1, TargetEpoch: 3, BeaconBlockRoot: innerRoot,
 		}.SigningRoot(e2.state.Snapshot()), atts2); r != domain.ReasonSurroundVote {
 		t.Fatalf("want SURROUND_VOTE, got %q", r)
 	}
-	t.Log("用例: 新区间被既有记录完全包含 -> SURROUND_VOTE")
+
+	// 反向 surround：已有小区间 (1,3)，再来大区间 (0,4) 同样拒绝。
+	e3 := setup(t)
+	small := e3.advanceTo(1, 24, 1) // epoch 3
+	small.SourceEpoch = 1
+	small.TargetEpoch = 3
+	if _, err := e3.client.SignAttestation(small); err != nil {
+		t.Fatalf("small sign: %v", err)
+	}
+	atts3, _ := e3.store.Snapshot()
+	largeRoot := bytes32("large-head-32-bytes-000000000000")
+	if _, r := guard.FindAttestationConflict(1, 0, 4, largeRoot,
+		domain.AttestationRequest{
+			Duty:        domain.Duty{Slot: 32, ValidatorIndex: 1},
+			SourceEpoch: 0, TargetEpoch: 4, BeaconBlockRoot: largeRoot,
+		}.SigningRoot(e3.state.Snapshot()), atts3); r != domain.ReasonSurroundVote {
+		t.Fatalf("want reverse SURROUND_VOTE, got %q", r)
+	}
+	t.Log("用例: 新区间被既有记录完全包含 -> SURROUND_VOTE；反向包含同样拒绝")
 }
 
 func TestBlockProposalNoDoubleSign(t *testing.T) {
 	t.Log("业务: 区块提议 —— 同 slot 不重复签署")
 	e := setup(t)
-	e.advanceTo(10, 1)
+	e.advanceTo(1, 10, 1)
 	block := domain.BlockProposalRequest{
-		Duty:       domain.Duty{ValidatorIndex: 1, Slot: 10},
-		ParentRoot: []byte("parent-root-32-bytes-0000000000000000000"),
-		StateRoot:  []byte("state-root-32-bytes-000000000000000000000"),
-		BodyRoot:   []byte("body-root-32-bytes-0000000000000000000000"),
+		Duty:            domain.Duty{ValidatorIndex: 1, Slot: 10},
+		BeaconPublicKey: append([]byte(nil), e.vals[1].BeaconPubKey...),
+		ParentRoot:      bytes32("parent-root-32-bytes-000000000"),
+		StateRoot:       bytes32("state-root-32-bytes-0000000000000"),
+		BodyRoot:        bytes32("body-root-32-bytes-00000000000000"),
 	}
 	if _, err := e.client.SignBlock(block); err != nil {
 		t.Fatalf("first block sign: %v", err)
@@ -221,9 +366,8 @@ func TestBlockProposalNoDoubleSign(t *testing.T) {
 	if _, err := e.client.SignBlock(block); reason(err) != domain.ReasonDuplicateDuty {
 		t.Fatalf("identical block: want DUPLICATE_DUTY, got %v", err)
 	}
-	t.Log("用例: 同一区块并发/重复 -> DUPLICATE_DUTY")
+	t.Log("用例: 同一区块重复 -> DUPLICATE_DUTY")
 
-	// 并发全新区块：只有 1 个成功
 	var success, dup int64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -250,9 +394,8 @@ func TestBlockProposalNoDoubleSign(t *testing.T) {
 func TestCrashRestartConsistency(t *testing.T) {
 	t.Log("业务: 崩溃恢复 —— 提交点前后崩溃，记录与结论一致")
 	e := setup(t)
-	duty := e.advanceTo(8, 1)
+	duty := e.advanceTo(1, 8, 1)
 
-	// 注入：rename 前崩溃 => 记录不存在，重开后可正常签署一次。
 	e.store.SetCrashHook(func(phase string) bool { return phase == "before_rename" })
 	if err := signErr(e.client, duty); !store.SimulatedCrash(err) {
 		t.Fatalf("want simulated crash, got %v", err)
@@ -267,7 +410,7 @@ func TestCrashRestartConsistency(t *testing.T) {
 	if len(atts) != 0 {
 		t.Fatalf("record must not exist before rename, got %d", len(atts))
 	}
-	client2 := guard.NewClient(e.state, st2, e.clientValue())
+	client2 := guard.NewClient(e.state, st2, e.vals[1])
 	if _, err := client2.SignAttestation(duty); err != nil {
 		t.Fatalf("re-sign after pre-rename crash: %v", err)
 	}
@@ -276,9 +419,8 @@ func TestCrashRestartConsistency(t *testing.T) {
 		t.Fatalf("want 1 record, got %d", len(atts))
 	}
 
-	// 注入：rename 后、返回前崩溃 => 记录已固化，重开后视为已签。
 	e2 := setup(t)
-	d2 := e2.advanceTo(8, 1)
+	d2 := e2.advanceTo(1, 8, 1)
 	e2.store.SetCrashHook(func(phase string) bool { return phase == "after_rename" })
 	err = signErr(e2.client, d2)
 	if !store.SimulatedCrash(err) {
@@ -292,7 +434,7 @@ func TestCrashRestartConsistency(t *testing.T) {
 	if len(atts3) != 1 {
 		t.Fatalf("committed record must survive crash, got %d", len(atts3))
 	}
-	client3 := guard.NewClient(e2.state, st3, e2.clientValue())
+	client3 := guard.NewClient(e2.state, st3, e2.vals[1])
 	if _, err := client3.SignAttestation(d2); reason(err) != domain.ReasonDuplicateDuty {
 		t.Fatalf("post-crash re-sign must be DUPLICATE_DUTY, got %v", err)
 	}
@@ -302,7 +444,7 @@ func TestCrashRestartConsistency(t *testing.T) {
 func TestRollbackPreservesRecords(t *testing.T) {
 	t.Log("业务: 链状态回退 —— 历史记录不撤销，新判定基于回退后状态")
 	e := setup(t)
-	duty := e.advanceTo(8, 1)
+	duty := e.advanceTo(1, 8, 1)
 	if _, err := e.client.SignAttestation(duty); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +453,6 @@ func TestRollbackPreservesRecords(t *testing.T) {
 	if len(atts) != 1 {
 		t.Fatalf("records revoked by rollback: %d", len(atts))
 	}
-	// 旧职责在回退状态下变成“未来 slot”，基于回退后状态拒绝（不能放行）。
 	if _, err := e.client.SignAttestation(duty); reason(err) != domain.ReasonDutyFuture {
 		t.Fatalf("want DUTY_FUTURE after rollback, got %v", err)
 	}
@@ -322,5 +463,3 @@ func signErr(c *guard.Client, a domain.AttestationRequest) error {
 	_, err := c.SignAttestation(a)
 	return err
 }
-
-func (e *env) clientValue() *guard.Validator { return e.val }

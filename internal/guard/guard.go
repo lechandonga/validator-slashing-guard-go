@@ -12,6 +12,8 @@ package guard
 import (
 	"bytes"
 	"crypto/ed25519"
+	"sort"
+	"sync"
 
 	"github.com/lechandonga/validator-slashing-guard-go/internal/domain"
 	"github.com/lechandonga/validator-slashing-guard-go/internal/store"
@@ -19,25 +21,102 @@ import (
 
 // Validator 是本地验证者的签名身份。
 type Validator struct {
-	Index      uint64
-	PublicKey  ed25519.PublicKey
-	privateKey ed25519.PrivateKey
+	Index        uint64
+	PublicKey    ed25519.PublicKey // 签名密钥公钥（本地 Ed25519 确定性签名用）
+	BeaconPubKey []byte            // 链上 BLS 公钥（48 字节，EIP-3076 身份键）
+	privateKey   ed25519.PrivateKey
 }
 
-func NewValidator(index uint64, priv ed25519.PrivateKey) *Validator {
+// NewValidator 创建一个本地签名身份。beaconPubKey 是该验证者的链上 BLS
+// 公钥（48 字节），作为互导文件中的身份键与多身份归属依据。
+func NewValidator(index uint64, beaconPubKey []byte, priv ed25519.PrivateKey) *Validator {
 	pub := priv.Public().(ed25519.PublicKey)
-	return &Validator{Index: index, PublicKey: append(ed25519.PublicKey(nil), pub...), privateKey: priv}
+	return &Validator{
+		Index:        index,
+		PublicKey:    append(ed25519.PublicKey(nil), pub...),
+		BeaconPubKey: append([]byte(nil), beaconPubKey...),
+		privateKey:   priv,
+	}
 }
 
 // Client 是签名客户端：持有链状态、记录存储与验证者身份。
 type Client struct {
-	state *domain.ChainState
-	store *store.Store
-	val   *Validator
+	state      *domain.ChainState
+	store      *store.Store
+	mu         sync.RWMutex
+	validators map[uint64]*Validator
+	byPubkey   map[string]uint64
 }
 
-func NewClient(state *domain.ChainState, st *store.Store, val *Validator) *Client {
-	return &Client{state: state, store: st, val: val}
+// NewClient 创建托管多个验证者身份的客户端。所有身份共用链状态与记录存储，
+// 记录按身份索引隔离，判定与导出均不串用。
+func NewClient(state *domain.ChainState, st *store.Store, vals ...*Validator) *Client {
+	c := &Client{
+		state:      state,
+		store:      st,
+		validators: map[uint64]*Validator{},
+		byPubkey:   map[string]uint64{},
+	}
+	for _, v := range vals {
+		c.AddValidator(v)
+	}
+	return c
+}
+
+// AddValidator 注册一个本地托管身份。索引与 BLS 公钥都必须唯一。
+func (c *Client) AddValidator(v *Validator) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.validators[v.Index]; exists {
+		panic("guard: duplicate validator index registered")
+	}
+	key := string(v.BeaconPubKey)
+	if _, exists := c.byPubkey[key]; exists {
+		panic("guard: duplicate validator pubkey registered")
+	}
+	c.validators[v.Index] = v
+	c.byPubkey[key] = v.Index
+}
+
+func (c *Client) validator(index uint64) (*Validator, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.validators[index]
+	if !ok {
+		return nil, domain.GuardErrorf(domain.ReasonUnknownValidator,
+			"validator index %d is not hosted locally", index)
+	}
+	return v, nil
+}
+
+// ValidatorIndexByPubkey / PubkeyByValidatorIndex / HostedValidators
+// 实现 interchange.ValidatorDirectory，供互导按身份合并与导出。
+func (c *Client) ValidatorIndexByPubkey(pubkey []byte) (uint64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	index, ok := c.byPubkey[string(pubkey)]
+	return index, ok
+}
+
+func (c *Client) PubkeyByValidatorIndex(index uint64) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.validators[index]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), v.BeaconPubKey...), true
+}
+
+func (c *Client) HostedValidators() []uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]uint64, 0, len(c.validators))
+	for index := range c.validators {
+		out = append(out, index)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Store 暴露记录存储（导入/导出等需要直接访问）。
@@ -46,13 +125,17 @@ func (c *Client) Store() *store.Store { return c.store }
 // SignAttestation 执行一次证明签名职责。
 // 返回 GuardError 时一定没有产生任何新签名与新记录。
 func (c *Client) SignAttestation(req domain.AttestationRequest) (domain.SignedResult, error) {
+	val, err := c.validator(req.ValidatorIndex)
+	if err != nil {
+		return domain.SignedResult{}, err
+	}
 	head := c.state.Snapshot()
 
 	var res domain.SignedResult
-	err := c.store.Update(func(atts []domain.AttestationRecord, blocks []domain.BlockRecord) (
+	err = c.store.Update(func(atts []domain.AttestationRecord, blocks []domain.BlockRecord) (
 		[]domain.AttestationRecord, []domain.BlockRecord, error) {
 
-		if err := ValidateAttestation(req, head); err != nil {
+		if err := ValidateAttestation(req, head, val.BeaconPubKey); err != nil {
 			return nil, nil, err
 		}
 		signingRoot := req.SigningRoot(head)
@@ -73,7 +156,7 @@ func (c *Client) SignAttestation(req domain.AttestationRequest) (domain.SignedRe
 			BeaconBlockRoot: append([]byte(nil), req.BeaconBlockRoot...),
 			SignedAtSlot:    head.CurrentSlot,
 		}
-		res = c.sign(signingRoot)
+		res = c.sign(val, signingRoot)
 		return append(atts, rec), blocks, nil
 	})
 	return res, err
@@ -81,13 +164,17 @@ func (c *Client) SignAttestation(req domain.AttestationRequest) (domain.SignedRe
 
 // SignBlock 执行一次区块提议签名职责。
 func (c *Client) SignBlock(req domain.BlockProposalRequest) (domain.SignedResult, error) {
+	val, err := c.validator(req.ValidatorIndex)
+	if err != nil {
+		return domain.SignedResult{}, err
+	}
 	head := c.state.Snapshot()
 
 	var res domain.SignedResult
-	err := c.store.Update(func(atts []domain.AttestationRecord, blocks []domain.BlockRecord) (
+	err = c.store.Update(func(atts []domain.AttestationRecord, blocks []domain.BlockRecord) (
 		[]domain.AttestationRecord, []domain.BlockRecord, error) {
 
-		if err := ValidateBlock(req, head); err != nil {
+		if err := ValidateBlock(req, head, val.BeaconPubKey); err != nil {
 			return nil, nil, err
 		}
 		signingRoot := req.SigningRoot(head)
@@ -115,29 +202,38 @@ func (c *Client) SignBlock(req domain.BlockProposalRequest) (domain.SignedResult
 			StateRoot:      append([]byte(nil), req.StateRoot...),
 			BodyRoot:       append([]byte(nil), req.BodyRoot...),
 		}
-		res = c.sign(signingRoot)
+		res = c.sign(val, signingRoot)
 		return atts, append(blocks, rec), nil
 	})
 	return res, err
 }
 
 // sign 是确定性签名：相同私钥 + 相同签名根永远得到相同签名。
-func (c *Client) sign(signingRoot []byte) domain.SignedResult {
-	sig := ed25519.Sign(c.val.privateKey, signingRoot)
+func (c *Client) sign(val *Validator, signingRoot []byte) domain.SignedResult {
+	sig := ed25519.Sign(val.privateKey, signingRoot)
 	return domain.SignedResult{
 		SigningRoot: append([]byte(nil), signingRoot...),
 		Signature:   sig,
-		PublicKey:   append(ed25519.PublicKey(nil), c.val.PublicKey...),
+		PublicKey:   append(ed25519.PublicKey(nil), val.PublicKey...),
 	}
 }
 
 // ReplaySignature 依据已固化记录重新派生签名（崩溃恢复后的解释/重放，而非重新签署）。
-func (c *Client) ReplaySignature(signingRoot []byte) domain.SignedResult {
-	return c.sign(signingRoot)
+func (c *Client) ReplaySignature(validatorIndex uint64, signingRoot []byte) (domain.SignedResult, error) {
+	val, err := c.validator(validatorIndex)
+	if err != nil {
+		return domain.SignedResult{}, err
+	}
+	return c.sign(val, signingRoot), nil
 }
 
-// ValidateAttestation 是证明签名准入规则（纯函数，导入与签名共用）。
-func ValidateAttestation(req domain.AttestationRequest, h domain.ChainHead) error {
+// ValidateAttestation 是证明签名准入规则（纯函数）。
+// expectedPubKey 是该索引在本地托管身份的 BLS 公钥：请求携带的身份与之
+// 不一致时以 IDENTITY_MISMATCH 拒绝，绝不签署、绝不留记录。
+func ValidateAttestation(req domain.AttestationRequest, h domain.ChainHead, expectedPubKey []byte) error {
+	if err := validateIdentity(req.ValidatorIndex, req.BeaconPublicKey, expectedPubKey); err != nil {
+		return err
+	}
 	if len(req.BeaconBlockRoot) == 0 {
 		return domain.GuardErrorf(domain.ReasonInvalidRequest, "beacon block root is empty")
 	}
@@ -172,7 +268,10 @@ func ValidateAttestation(req domain.AttestationRequest, h domain.ChainHead) erro
 }
 
 // ValidateBlock 是区块提议签名准入规则（纯函数）。
-func ValidateBlock(req domain.BlockProposalRequest, h domain.ChainHead) error {
+func ValidateBlock(req domain.BlockProposalRequest, h domain.ChainHead, expectedPubKey []byte) error {
+	if err := validateIdentity(req.ValidatorIndex, req.BeaconPublicKey, expectedPubKey); err != nil {
+		return err
+	}
 	if len(req.ParentRoot) == 0 || len(req.StateRoot) == 0 || len(req.BodyRoot) == 0 {
 		return domain.GuardErrorf(domain.ReasonInvalidRequest, "block roots must not be empty")
 	}
@@ -184,6 +283,20 @@ func ValidateBlock(req domain.BlockProposalRequest, h domain.ChainHead) error {
 	if req.Slot > cur {
 		return domain.GuardErrorf(domain.ReasonDutyFuture,
 			"proposal slot %d is ahead of chain slot %d", req.Slot, cur)
+	}
+	return nil
+}
+
+func validateIdentity(index uint64, requestedPubKey, expectedPubKey []byte) error {
+	if len(requestedPubKey) == 0 {
+		return domain.GuardErrorf(domain.ReasonIdentityMismatch,
+			"duty for validator %d carries no validator public key", index)
+	}
+	if !bytes.Equal(requestedPubKey, expectedPubKey) {
+		return domain.GuardErrorf(domain.ReasonIdentityMismatch,
+			"duty public key for validator %d does not match the locally hosted identity "+
+				"(requested=0x%x, hosted=0x%x)",
+			index, requestedPubKey, expectedPubKey)
 	}
 	return nil
 }
@@ -207,8 +320,10 @@ func FindAttestationConflict(validatorIndex, reqSource, reqTarget uint64,
 			!bytes.Equal(old.BeaconBlockRoot, blockRoot) {
 			double = old
 		}
-		// 新区间 (source,target) 被既有区间严格包含 => surrounded 罚没。
-		if surround == nil && old.SourceEpoch < reqSource && old.TargetEpoch > reqTarget {
+		// 区间互相严格包含任一方向都构成 surround 罚没。
+		if surround == nil &&
+			((old.SourceEpoch < reqSource && old.TargetEpoch > reqTarget) ||
+				(reqSource < old.SourceEpoch && reqTarget > old.TargetEpoch)) {
 			surround = old
 		}
 	}

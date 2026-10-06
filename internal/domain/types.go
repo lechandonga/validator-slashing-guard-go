@@ -14,6 +14,7 @@ type Duty struct {
 // AttestationRequest 是证明签名请求（attestation duty）。
 type AttestationRequest struct {
 	Duty
+	BeaconPublicKey []byte // 请求声称的验证者 BLS 公钥，必须与该索引的本地身份一致
 	SourceEpoch     uint64
 	TargetEpoch     uint64
 	BeaconBlockRoot []byte // 被投票的区块根，决定同一 target epoch 下两个证明是否“内容不同”
@@ -22,9 +23,10 @@ type AttestationRequest struct {
 // BlockProposalRequest 是区块提议签名请求（block proposal duty）。
 type BlockProposalRequest struct {
 	Duty
-	ParentRoot []byte
-	StateRoot  []byte
-	BodyRoot   []byte
+	BeaconPublicKey []byte // 请求声称的验证者 BLS 公钥，必须与该索引的本地身份一致
+	ParentRoot      []byte
+	StateRoot       []byte
+	BodyRoot        []byte
 }
 
 // SignedResult 是一次签名的确定性产物。
@@ -82,6 +84,9 @@ const (
 	ReasonDuplicateBlockSlot = "DUPLICATE_BLOCK_SLOT" // 同一 slot 的区块重复签署
 	ReasonImportConflict     = "IMPORT_CONFLICT"      // 导入数据与既有记录构成罚没冲突
 	ReasonImportInvalid      = "IMPORT_INVALID"       // 导入文件格式 / 内容不合法
+	ReasonIdentityMismatch   = "IDENTITY_MISMATCH"    // 请求携带的身份与实际签署身份不一致
+	ReasonUnknownValidator   = "UNKNOWN_VALIDATOR"    // 本地不存在该验证者身份（索引 / 公钥未知）
+	ReasonImportAmbiguous    = "IMPORT_AMBIGUOUS"     // 判定冲突所需信息缺失，无法确定是否为同一次签署
 )
 
 // GuardError 携带可区分原因码与说明，绝不代表“已签署”。
